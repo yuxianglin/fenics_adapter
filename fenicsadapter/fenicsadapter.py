@@ -4,7 +4,7 @@ adapter.
 :raise ImportError: if PRECICE_ROOT is not defined
 """
 import dolfin
-from dolfin import UserExpression, SubDomain
+from dolfin import UserExpression, SubDomain, File, info, mpi_comm_world, MPI, vertex_to_dof_map, facets, vertices
 from scipy.interpolate import Rbf
 from scipy.interpolate import interp1d
 import numpy as np
@@ -24,65 +24,6 @@ except ImportError:
     import precice
 
 
-class CustomExpression(UserExpression):
-    """Creates functional representation (for FEniCS) of nodal data
-    provided by preCICE.
-    """
-    def set_boundary_data(self, vals, coords_x, coords_y=None, coords_z=None):
-        self.update_boundary_data(vals, coords_x, coords_y, coords_z)
-
-    def update_boundary_data(self, vals, coords_x, coords_y=None, coords_z=None):
-        self._coords_x = coords_x
-        if coords_y is None:
-            coords_y = np.zeros(self._coords_x.shape)
-        self._coords_y = coords_y
-        if coords_z is None:
-            coords_z = np.zeros(self._coords_x.shape)
-        self._coords_z = coords_z
-
-        self._vals = vals.flatten()
-        assert (self._vals.shape == self._coords_x.shape)
-
-    def interpolate(self, x):
-        """
-        TODO: the correct way to deal with this would be using an abstract class. Since this is technically more complex and the current implementation is a workaround anyway, we do not use the proper solution, but this hack.
-        """
-        raise Exception("Please use one of the classes derived from this class, that implements an actual strategy for"
-                        "interpolation.")
-        pass
-
-    def eval(self, value, x):
-        value[0] = self.interpolate(x)
-
-
-class GeneralInterpolationExpression(CustomExpression):
-    """Uses RBF interpolation for implementation of CustomExpression.interpolate. Allows for arbitrary coupling
-    interfaces, but has limited accuracy.
-    """
-    def interpolate(self, x):
-        if x.__len__() == 1:
-            f = Rbf(self._coords_x, self._vals.flatten())
-            return f(x)
-        if x.__len__() == 2:
-            f = Rbf(self._coords_x, self._coords_y, self._vals.flatten())
-            return f(x[0], x[1])
-        if x.__len__() == 3:
-            f = Rbf(self._coords_x, self._coords_y, self._coords_z, self._vals.flatten())
-            return f(x[0], x[1], x[2])
-
-
-class ExactInterpolationExpression(CustomExpression):
-    """Uses cubic spline interpolation for implementation of CustomExpression.interpolate. Only allows intepolation on
-    coupling that are parallel to the y axis, and if the coordinates in self._coords_y are ordered such that the nodes
-    on the coupling mesh are traversed w.r.t their connectivity.
-    However, this method allows to exactly recover the solution at the coupling interface, if it is a polynomial of
-    order 3 or lower.
-    See also https://github.com/precice/fenics-adapter/milestone/1
-    """
-    def interpolate(self, x):
-        f = interp1d(self._coords_y, self._vals, bounds_error=False, fill_value="extrapolate", kind="cubic")
-        return f(x[1])
-
 
 class Adapter:
     """Initializes the Adapter. Initalizer creates object of class Config (from
@@ -90,27 +31,28 @@ class Adapter:
 
     :ivar _config: object of class Config, which stores data from the JSON config file
     """
-    def __init__(self, adapter_config_filename='precice-adapter-config.json',
-                 interpolation_strategy=GeneralInterpolationExpression):
+    def __init__(self, adapter_config_filename='precice-adapter-config.json'):
 
         self._config = Config(adapter_config_filename)
 
         self._solver_name = self._config.get_solver_name()
 
-        self._interface = precice.Interface(self._solver_name, 0, 1)
+        self.comm=mpi_comm_world()
+        self.rank=MPI.rank(self.comm)
+        self.size=MPI.size(self.comm)
+
+        self._interface = precice.Interface(self._solver_name, self.rank, self.size)
         self._interface.configure(self._config.get_config_file_name())
         self._dimensions = self._interface.get_dimensions()
 
         self._coupling_subdomain = None # initialized later
-        self._mesh_fenics = None # initialized later
-        self._coupling_bc_expression = None # initialized later
+        self._V_fenics = None # initialized later
 
         ## coupling mesh related quantities
         self._coupling_mesh_vertices = None # initialized later
         self._mesh_name = self._config.get_coupling_mesh_name()
         self._mesh_id = self._interface.get_mesh_id(self._mesh_name)
         self._vertex_ids = None # initialized later
-        self._n_vertices = None # initialized later
 
         ## write data related quantities (write data is written by this solver to preCICE)
         self._write_data_name = self._config.get_write_data_name()
@@ -124,14 +66,10 @@ class Adapter:
 
         ## numerics
         self._precice_tau = None
-        self._my_expression = interpolation_strategy
 
         ## checkpointing
-        self._u_cp = None  # checkpoint for temperature inside domain
-        self._t_cp = None  # time of the checkpoint
-        self._n_cp = None  # timestep of the checkpoint
 
-    def convert_fenics_to_precice(self, data, mesh, subdomain):
+    def convert_fenics_to_precice(self, data, dofs):
         """Converts FEniCS data of type dolfin.Function into
         Numpy array for all x and y coordinates on the boundary.
 
@@ -140,12 +78,10 @@ class Adapter:
         :return: array of FEniCS function values at each point on the boundary
         """
         if type(data) is dolfin.Function:
-            x_all, y_all = self.extract_coupling_boundary_coordinates()
-            return np.array([data(x, y) for x, y in zip(x_all, y_all)])
-        else:
-            raise Exception("Cannot handle data type %s" % type(data))
-
-    def extract_coupling_boundary_vertices(self):
+            return data.vector()[dofs]
+        elif type(data) is dolfin.cpp.la.Vector:
+            return data.get_local()[dofs]
+    def extract_coupling_boundary_vertices1(self, function_space):
         """Extracts verticies which lay on the boundary. Currently handles 2D
         case properly, 3D is circumvented.
 
@@ -153,6 +89,62 @@ class Adapter:
         :return: stack of verticies
         """
         n = 0
+        local_dofs=[]
+        vertices_x = []
+        vertices_y = []
+        if self._dimensions == 3:
+            vertices_z = []
+        con=[]
+
+        if not issubclass(type(self._coupling_subdomain), SubDomain):
+            raise Exception("no correct coupling interface defined!")
+       
+        mesh=function_space.mesh()
+        v2d=vertex_to_dof_map(function_space)
+        value_size=function_space.ufl_element().value_size()
+        for f in facets(mesh):
+            interface=True
+            #if f.exterior():
+            for v in vertices(f):
+                if self._dimensions==2:
+                    if not self._coupling_subdomain.inside([v.x(0), v.x(1)], True):
+                        interface=False
+                elif self._dimensions==3:
+                    if not self._coupling_subdomain.inside([v.x(0), v.x(1), v.x(2)], True):
+                        interface=False
+            #else:
+            #    interface=False
+            if interface:
+                for v in vertices(f):
+                    for ii in range(value_size):
+                        local_dof=v2d[value_size*v.index()+ii]
+                        if ii==0:
+                            con.append(local_dof)
+                        if local_dof not in local_dofs:
+                            local_dofs.append(local_dof)
+                            if ii==0:
+                                n+=1
+                                vertices_x.append(v.x(0))
+                                vertices_y.append(v.x(1))
+                                if self._dimensions == 3:
+                                    vertices_z.append(v.x(2))
+
+
+
+        if self._dimensions == 2:
+            return np.column_stack([vertices_x, vertices_y]), n, local_dofs, con
+        elif self._dimensions == 3:
+            return np.column_stack([vertices_x, vertices_y, vertices_z]), n, local_dofs, con
+
+    def extract_coupling_boundary_vertices(self, function_space):
+        """Extracts verticies which lay on the boundary. Currently handles 2D
+        case properly, 3D is circumvented.
+
+        :raise Exception: if no correct coupling interface is defined
+        :return: stack of verticies
+        """
+        n = 0
+        local_dofs=[]
         vertices_x = []
         vertices_y = []
         if self._dimensions == 3:
@@ -160,30 +152,57 @@ class Adapter:
 
         if not issubclass(type(self._coupling_subdomain), SubDomain):
             raise Exception("no correct coupling interface defined!")
-
-        for v in dolfin.vertices(self._mesh_fenics):
-            if self._coupling_subdomain.inside(v.point(), True):
-                n += 1
-                vertices_x.append(v.x(0))
-                vertices_y.append(v.x(1))
+        
+        dofs=function_space.dofmap().dofs()#global_dof
+        value_size=function_space.ufl_element().value_size()
+        coords=function_space.tabulate_dof_coordinates().reshape(len(dofs), self._dimensions)[range(0, len(dofs), value_size)]
+        for ii, coord in enumerate(coords):#ii is local dof
+            if self._coupling_subdomain.inside(coord, True):
+                n+=1
+                for jj in range(value_size):
+                    local_dofs.append(value_size*ii + jj)
+                vertices_x.append(coord[0])
+                vertices_y.append(coord[1])
                 if self._dimensions == 3:
-                    # todo this has to be fixed for "proper" 3D coupling. Currently this is a workaround for the coupling of 2D fenics with pseudo 3D openfoam
-                    vertices_z.append(0)
+                    vertices_z.append(coord[2])
+
 
         if self._dimensions == 2:
-            return np.stack([vertices_x, vertices_y]), n
+            return np.column_stack([vertices_x, vertices_y]), n, local_dofs, []
         elif self._dimensions == 3:
-            return np.stack([vertices_x, vertices_y, vertices_z]), n
+            return np.column_stack([vertices_x, vertices_y, vertices_z]), n, local_dofs, []
 
-    def set_coupling_mesh(self, mesh, subdomain):
+    def set_coupling_mesh(self, read_function_space, write_function_space, subdomain, mapping):
         """Sets the coupling mesh. Called by initalize() function at the
         beginning of the simulation.
         """
         self._coupling_subdomain = subdomain
-        self._mesh_fenics = mesh
-        self._coupling_mesh_vertices, self._n_vertices = self.extract_coupling_boundary_vertices()
-        self._vertex_ids = np.zeros(self._n_vertices)
-        self._interface.set_mesh_vertices(self._mesh_id, self._n_vertices, self._coupling_mesh_vertices.flatten('F'), self._vertex_ids)
+        #self._V_fenics = function_space
+        self.read_coupling_mesh_vertices,  self.read_n_vertices,  self.read_local_dofs, con= self.extract_coupling_boundary_vertices1(read_function_space)
+        self.write_coupling_mesh_vertices, self.write_n_vertices, self.write_local_dofs, con=self.extract_coupling_boundary_vertices1(write_function_space)
+        assert(self.read_coupling_mesh_vertices.shape[0]==self.read_n_vertices)
+        assert(self.write_coupling_mesh_vertices.shape[0]==self.write_n_vertices)
+        assert(self.read_coupling_mesh_vertices.shape[1]==self._dimensions)
+        assert(self.write_coupling_mesh_vertices.shape[1]==self._dimensions)
+        if self.read_n_vertices!=self.write_n_vertices:
+            raise Exception("read data and write data should have at least same order!")
+        if mapping:
+            self.read_coupling_mesh_vertices=mapping(self.read_coupling_mesh_vertices)
+        self.read_vertex_ids = np.zeros(self.read_n_vertices)
+        self.write_vertex_ids = np.zeros(self.write_n_vertices)
+        if self.read_n_vertices>0:
+            self._interface.set_mesh_vertices(self._mesh_id, self.read_n_vertices, self.read_coupling_mesh_vertices.flatten(), self.read_vertex_ids)
+            self.write_vertex_ids=self.read_vertex_ids
+            if con:
+                numElement=len(con)//3
+                for ii in range(numElement):
+                    v1=con[3*ii]
+                    v2=con[3*ii+1]
+                    v3=con[3*ii+2]
+                    ind1=self.write_local_dofs.index(v1)
+                    ind2=self.write_local_dofs.index(v2)
+                    ind3=self.write_local_dofs.index(v3)
+                    self._interface.set_mesh_triangle_with_edges(self._mesh_id, self.read_vertex_ids[ind1], self.read_vertex_ids[ind2], self.read_vertex_ids[ind3])
 
     def set_write_field(self, write_function_init):
         """Sets the write field. Called by initalize() function at the
@@ -191,15 +210,15 @@ class Adapter:
 
         :param write_function_init: function on the write field
         """
-        self._write_data = self.convert_fenics_to_precice(write_function_init, self._mesh_fenics, self._coupling_subdomain)
+        self._write_data = self.convert_fenics_to_precice(write_function_init, self.write_local_dofs)
+        #self._write_data = self.convert_fenics_to_precice(write_function_init)
 
-    def set_read_field(self, read_function_init):
+    def set_read_field(self):
         """Sets the read field. Called by initalize() function at the
         beginning of the simulation.
 
-        :param read_function_init: function on the read field
         """
-        self._read_data = self.convert_fenics_to_precice(read_function_init, self._mesh_fenics, self._coupling_subdomain)
+        self._read_data = np.zeros(len(self.read_local_dofs))
 
     def create_coupling_boundary_condition(self):
         """Creates the coupling boundary conditions using an actual implementation CustomExpression."""
@@ -231,7 +250,8 @@ class Adapter:
         self.create_coupling_boundary_condition()
         return self._coupling_bc_expression * test_functions * dolfin.ds  # this term has to be added to weak form to add a Neumann BC (see e.g. p. 83ff Langtangen, Hans Petter, and Anders Logg. "Solving PDEs in Python The FEniCS Tutorial Volume I." (2016).)
 
-    def advance(self, write_function, u_np1, u_n, t, dt, n):
+    def advance(self, write_function, read_function, dt, T=None,  init_data1=None, init_data2=None, init_data3=None):
+    #def advance(self, write_function, read_function, u_n, t, dt, n):
         """Calls preCICE advance function using precice and manages checkpointing.
         The solution u_n is updated by this function via call-by-reference. The corresponding values for t and n are returned.
 
@@ -248,68 +268,118 @@ class Adapter:
         :return: return starting time t and timestep n for next FEniCS solver iteration. u_n is updated by advance correspondingly.
         """
 
+        precice_step_complete = False
+        fsi_converged=False
+
         # sample write data at interface
-        x_vert, y_vert = self.extract_coupling_boundary_coordinates()
-        self._write_data = self.convert_fenics_to_precice(write_function, self._mesh_fenics, self._coupling_subdomain)
+        if self._interface.is_action_required(precice.action_write_iteration_checkpoint()):
+            #if T:self.init_T=float(T)
+            #if dt:self.init_dt=float(dt)
+            #self.init_T=float(T)
+            #self.init_dt=float(dt)
+            #if init_data1:self.init_data1=init_data1.copy(True)
+            #if init_data2:self.init_data2=init_data2.copy(True)
+            #if init_data3:self.init_data3=init_data3.copy(True)
+            #fsi_converged=True
+            self._interface.fulfilled_action(precice.action_write_iteration_checkpoint())
+
+        self._write_data = self.convert_fenics_to_precice(write_function, self.write_local_dofs)
 
         # communication
-        self._interface.write_block_scalar_data(self._write_data_id, self._n_vertices, self._vertex_ids, self._write_data)
-        max_dt = self._interface.advance(dt)
-        self._interface.read_block_scalar_data(self._read_data_id, self._n_vertices, self._vertex_ids, self._read_data)
+        if self.read_n_vertices>0:
+            if self._write_data_name=="Force" or self._write_data_name=="Displacement":
+                self._interface.write_block_vector_data(self._write_data_id, self.write_n_vertices, self.write_vertex_ids, self._write_data)
+            elif self._write_data_name=="Pressure":
+                self._interface.write_block_scalar_data(self._write_data_id, self.write_n_vertices, self.write_vertex_ids, self._write_data)
+        self._precice_tau = self._interface.advance(float(dt))
+        dt.assign(min(self._precice_tau, float(dt)))
+        if self.read_n_vertices>0:
+            self._interface.read_block_vector_data(self._read_data_id, self.read_n_vertices, self.read_vertex_ids, self._read_data)
+
+        read_function.vector()[self.read_local_dofs]=self._read_data
 
         # update boundary condition with read data
-        self._coupling_bc_expression.update_boundary_data(self._read_data, x_vert, y_vert)
+        #self._coupling_bc_expression.update_boundary_data(self._read_data, x_vert, y_vert)
 
-        precice_step_complete = False
+#        precice_step_complete = False
+#        fsi_converged=False
 
         # checkpointing
-        if self._interface.is_action_required(precice.action_read_iteration_checkpoint()):
-            # continue FEniCS computation from checkpoint
-            u_n.assign(self._u_cp)  # set u_n to value of checkpoint
-            t = self._t_cp
-            n = self._n_cp
+        if self._interface.is_action_required(precice.action_read_iteration_checkpoint()):#not yet converged
+            #if T:self.init_T=float(T)
+            #if dt:self.init_dt=float(dt)
+            #if init_data1:init_data1.vector()[:]=self.init_data1.vector() 
+            #if init_data2:init_data2.vector()[:]=self.init_data2.vector()
+            #if init_data3:init_data3.vector()[:]=self.init_data3.vector()
+            #dt.assign(self.init_dt)
+            #T.assign(self.init_T)
             self._interface.fulfilled_action(precice.action_read_iteration_checkpoint())
         else:
-            u_n.assign(u_np1)
-            t = new_t = t + dt  # todo the variables new_t, new_n could be saved, by just using t and n below, however I think it improved readability.
-            n = new_n = n + 1
+            precice_step_complete=True
 
-        if self._interface.is_action_required(precice.action_write_iteration_checkpoint()):
-            # continue FEniCS computation with u_np1
-            # update checkpoint
-            self._u_cp.assign(u_np1)
-            self._t_cp = new_t
-            self._n_cp = new_n
-            self._interface.fulfilled_action(precice.action_write_iteration_checkpoint())
-            precice_step_complete = True
+        #if self._interface.is_action_required(precice.action_write_iteration_checkpoint()):
+            #if T:self.init_T=float(T)
+            #if dt:self.init_dt=float(dt)
+        #    self.init_T=float(T)
+        #    self.init_dt=float(dt)
+        #    self.init_data1=init_data1.copy(True)
+        #    if init_data2:self.init_data2=init_data2.copy(True)
+        #    if init_data3:self.init_data3=init_data3.copy(True)
+        #    fsi_converged=True
+        #    self._interface.fulfilled_action(precice.action_write_iteration_checkpoint())
 
-        return t, n, precice_step_complete, max_dt
 
-    def initialize(self, coupling_subdomain, mesh, read_field, write_field, u_n, t=0, n=0):
+        #if self._interface.is_action_required(precice.action_write_iteration_checkpoint()):
+        #    self._interface.fulfilled_action(precice.action_write_iteration_checkpoint())
+
+        return precice_step_complete, self._interface.is_timestep_complete()
+
+    def initialize(self, coupling_subdomain, read_field, write_field, mapping=None, T=None, dt=None, init_data1=None, init_data2=None, init_data3=None):
         """Initializes remaining attributes. Called once, from the solver.
 
         :param read_field: function applied on the read field
         :param write_field: function applied on the write field
         """
-        self.set_coupling_mesh(mesh, coupling_subdomain)
-        self.set_read_field(read_field)
+
+        read_function_space=read_field.function_space()
+        try: 
+            write_function_space=write_field.function_space()
+        except:
+            write_function_space=read_function_space
+
+        self.set_coupling_mesh(read_function_space, write_function_space, coupling_subdomain, mapping)
         self.set_write_field(write_field)
+        self.set_read_field()
         self._precice_tau = self._interface.initialize()
+        #dt.assign(min(self._precice_tau, float(dt)))
 
         if self._interface.is_action_required(precice.action_write_initial_data()):
-            self._interface.write_block_scalar_data(self._write_data_id, self._n_vertices, self._vertex_ids, self._write_data)
+            if self.write_n_vertices>0:
+                if self._write_data_name=="Force" or self._write_data_name=="Displacement":
+                    self._interface.write_block_vector_data(self._write_data_id, self.write_n_vertices, self.write_vertex_ids, self._write_data)
+                elif self._write_data_name=="Pressure":
+                    self._interface.write_block_scalar_data(self._write_data_id, self.write_n_vertices, self.write_vertex_ids, self._write_data)
             self._interface.fulfilled_action(precice.action_write_initial_data())
 
         self._interface.initialize_data()
 
         if self._interface.is_read_data_available():
-            self._interface.read_block_scalar_data(self._read_data_id, self._n_vertices, self._vertex_ids, self._read_data)
+            if self.read_n_vertices>0:
+                self._interface.read_block_vector_data(self._read_data_id, self.read_n_vertices, self.read_vertex_ids, self._read_data)
 
         if self._interface.is_action_required(precice.action_write_iteration_checkpoint()):
-            self._u_cp = u_n.copy(deepcopy=True)
-            self._t_cp = t
-            self._n_cp = n
+            #if T:self.init_T=float(T)
+            #if dt:self.init_dt=float(dt)
+            #if init_data1:self.init_data1=init_data1.copy(True)
+            #if init_data2:self.init_data2=init_data2.copy(True)
+            #if init_data3:self.init_data3=init_data3.copy(True)
             self._interface.fulfilled_action(precice.action_write_iteration_checkpoint())
+        
+        #if self._interface.is_action_required(precice.action_write_iteration_checkpoint()):
+        #    self.dt_init=float(dt)
+        #    self._interface.fulfilled_action(precice.action_write_iteration_checkpoint())
+
+        read_field.vector()[self.read_local_dofs]=self._read_data
 
         return self._precice_tau
 
